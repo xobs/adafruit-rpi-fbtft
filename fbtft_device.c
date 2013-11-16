@@ -17,9 +17,12 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <asm/io.h>
+#include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/gpio.h>
 #include <linux/spi/spi.h>
 #include <linux/mfd/stmpe.h>
@@ -30,6 +33,33 @@
 #define DRVNAME "fbtft_device"
 
 #define MAX_GPIOS 32
+
+#define BCM2708_PERI_BASE	0x20000000
+#define GPIO_BASE		(BCM2708_PERI_BASE + 0x200000)
+
+#define GPIO_REG(g) (gpio_reg + ((g / 10) * 4))
+#define GPIO_GPPUD (0x94)
+#define GPIO_GPCLK0 (0x98)
+#define GPIO_GPCLK(x) (GPIO_GPCLK0 + 4 * ((x) >> 5))
+#define SET_GPIO_ALT(g,a) \
+	__raw_writel(                                                       \
+		(((a) <= 3 ? (a) + 4:(a) == 4 ? 3 : 2)<<(((g) % 10) * 3))   \
+		| (__raw_readl(GPIO_REG(g)) & ( ~(7 << (((g) % 10) * 3)))), \
+		GPIO_REG(g))
+
+#define GPIO_PULL_SET(pin, val) \
+	do { \
+		__raw_writel((val) & 3, gpio_reg + GPIO_GPPUD); \
+		msleep(5); \
+		__raw_writel(1 << ((pin) & 31), gpio_reg + GPIO_GPCLK(pin)); \
+		msleep(5); \
+		__raw_writel(0, gpio_reg + GPIO_GPPUD); \
+		msleep(5); \
+		__raw_writel(0, gpio_reg + GPIO_GPCLK(pin)); \
+		msleep(5); \
+	} while(0);
+#define GPIO_PULL_COMMIT(x)
+static void __iomem *gpio_reg;
 
 #define MAX_DEVS 8
 static struct spi_device *spi_devices[MAX_DEVS];
@@ -122,6 +152,21 @@ module_param(verbose, uint, 0);
 MODULE_PARM_DESC(verbose,
 "0 silent, >0 show gpios, >1 show devices, >2 show devices before (default=3)");
 
+static unsigned long frequency = 16000000;
+module_param(frequency, ulong, 0644);
+MODULE_PARM_DESC(frequency,
+"Frequency of the TFT SPI interface");
+
+enum gpio_pull {
+	pull_none = 0,
+	pull_down = 1,
+	pull_up = 2,
+};
+
+struct gpio_setting {
+	uint32_t gpio;
+	enum gpio_pull pull;
+};
 
 struct fbtft_device_display {
 	char *name;
@@ -132,7 +177,11 @@ struct fbtft_device_display {
 	 * set to "1" to indicate support device * (e.g. touchscreen
 	 * controller) that doesn't have a standard LCD platform data struct.
 	 */
-       int is_support;
+	int is_support;
+
+	/* GPIO Pullups/pulldown */
+	struct gpio_setting *gpio_settings;
+	uint32_t gpio_num_settings;
 };
 
 static void fbtft_device_pdev_release(struct device *dev);
@@ -293,12 +342,19 @@ static struct fbtft_device_display displays[] = {
 			}
 		},
 		.is_support = 1,
+		.gpio_settings = (struct gpio_setting []) {
+			{
+				.gpio = 24,
+				.pull = pull_up,
+			}
+		},
+		.gpio_num_settings = 1,
 	}, {
 		/* LCD component of adafruit touchscreen */
 		.name = "adafruitts",
 		.spi = &(struct spi_board_info) {
 			.modalias = "fb_ili9340",
-			.max_speed_hz = 15000000,
+			.max_speed_hz = 16000000,
 			.mode = SPI_MODE_0,
 			.chip_select = 0,
 			.platform_data = &(struct fbtft_platform_data) {
@@ -1056,8 +1112,11 @@ static int __init fbtft_device_init(void)
 		}
 	}
 
+	gpio_reg = ioremap(GPIO_BASE, 1024);
+
 	for (i = 0; i < ARRAY_SIZE(displays); i++) {
 		if (strncmp(name, displays[i].name, 32) == 0) {
+			int j;
 			if (displays[i].spi) {
 				int dev_cs;
 				spi = displays[i].spi;
@@ -1070,8 +1129,10 @@ static int __init fbtft_device_init(void)
 					spi->max_speed_hz = speed;
 				if (mode != -1)
 					spi->mode = mode;
-				if (!displays[i].is_support)
+				if (!displays[i].is_support) {
+					spi->max_speed_hz = frequency;
 					pdata = (void *)spi->platform_data;
+				}
 			} else if (displays[i].pdev) {
 				p_device = displays[i].pdev;
 				if (!displays[i].is_support)
@@ -1079,6 +1140,15 @@ static int __init fbtft_device_init(void)
 			} else {
 				pr_err(DRVNAME": broken displays array\n");
 				return -EINVAL;
+			}
+
+			for (j = 0; j < displays[i].gpio_num_settings; j++) {
+				pr_debug(DRVNAME": Looking at item %d\n", j);
+				pr_debug(DRVNAME": Setting pin %d to %d\n",
+					displays[i].gpio_settings[j].gpio,
+					displays[i].gpio_settings[j].pull);
+				GPIO_PULL_SET(displays[i].gpio_settings[j].gpio,
+					displays[i].gpio_settings[j].pull);
 			}
 
 			if (!displays[i].is_support && pdata) {
@@ -1173,6 +1243,8 @@ static void __exit fbtft_device_exit(void)
 	if (p_device)
 		platform_device_unregister(p_device);
 
+	if (gpio_reg)
+		iounmap(gpio_reg);
 }
 
 arch_initcall(fbtft_device_init);
